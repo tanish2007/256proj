@@ -1,6 +1,6 @@
 // --- Pin Definitions ---
 // Change these values to match your physical wiring on the CICS 256 board.
-
+#include <Arduino.h>
 // Ultrasonic Sensor (HC-SR04)
 // On your board, it looks like TRIG is meant to be 5, and ECHO might be 11 or 18.
 // Please check the small text on the board next to the Ultrasonic header!
