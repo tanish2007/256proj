@@ -69,14 +69,111 @@ const int BIT_LEFT  = 1;
 const int BIT_RIGHT = 2;
 const int BIT_BACK  = 3;
 
-const int NEAR_CM     = 40;   // Q-table state threshold
-const int SAFETY_CM   = 55;   // hard override — always stop if front < this
-const int BACKUP_CM   = 15;   // only back up if closer than this (nearly touching)
-const int MAX_DIST_CM = 200;
+// Two-threshold hysteresis prevents state flipping when a wall sits exactly
+// at the detection boundary. Bit goes high at THRESH_CLOSE, stays high until
+// the reading exceeds THRESH_CLEAR (4 cm dead band).
+const int THRESH_CLOSE = 38;
+const int THRESH_CLEAR = 42;
+const int MAX_DIST_CM  = 200;
 
 int currentState = 0;
-int prevAction   = -1;  // track previous action to avoid unnecessary stops
+int prevAction   = -1;
 
+unsigned long lastFreeMs  = 0;
+const unsigned long STUCK_MS = 10000;  // 10 seconds without reaching state 0 = stuck
+
+// --- ASYNC SENSOR READING (interrupt-driven, all 4 fire in parallel) ---
+// Each ISR records the micros() timestamp on rising edge (start) and falling
+// edge (end). The main loop fires all 4 triggers together, then waits up to
+// ECHO_TIMEOUT_US for every echo to complete.
+
+#define NUM_SENSORS 4
+const int TRIG_PINS[NUM_SENSORS] = { trig1, trig2, trig3, trig4 };
+const int ECHO_PINS[NUM_SENSORS] = { echo1, echo2, echo3, echo4 };
+
+volatile unsigned long echoStart[NUM_SENSORS];
+volatile unsigned long echoDur[NUM_SENSORS];
+volatile bool          echoReady[NUM_SENSORS];
+
+// One ISR per echo pin — must be in IRAM and as small as possible
+void IRAM_ATTR isrEcho0() {
+  if (digitalRead(echo1)) { echoStart[0] = micros(); }
+  else { echoDur[0] = micros() - echoStart[0]; echoReady[0] = true; }
+}
+void IRAM_ATTR isrEcho1() {
+  if (digitalRead(echo2)) { echoStart[1] = micros(); }
+  else { echoDur[1] = micros() - echoStart[1]; echoReady[1] = true; }
+}
+void IRAM_ATTR isrEcho2() {
+  if (digitalRead(echo3)) { echoStart[2] = micros(); }
+  else { echoDur[2] = micros() - echoStart[2]; echoReady[2] = true; }
+}
+void IRAM_ATTR isrEcho3() {
+  if (digitalRead(echo4)) { echoStart[3] = micros(); }
+  else { echoDur[3] = micros() - echoStart[3]; echoReady[3] = true; }
+}
+
+void (*ISR_TABLE[NUM_SENSORS])() = { isrEcho0, isrEcho1, isrEcho2, isrEcho3 };
+
+// Maximum echo wait: sound travels 4 m in ~23 ms; 30 ms covers up to ~5 m
+const unsigned long ECHO_TIMEOUT_US = 30000UL;
+
+void setupSensorInterrupts() {
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    echoStart[i] = 0;
+    echoDur[i]   = 0;
+    echoReady[i] = false;
+    attachInterrupt(digitalPinToInterrupt(ECHO_PINS[i]), ISR_TABLE[i], CHANGE);
+  }
+}
+
+// Fires all 4 triggers simultaneously, waits for echoes, returns cm distances.
+// Returns 999 for any sensor that times out (no echo / out of range).
+void readAllSensors(int* dF, int* dL, int* dR, int* dB) {
+  // Reset ready flags
+  noInterrupts();
+  for (int i = 0; i < NUM_SENSORS; i++) echoReady[i] = false;
+  interrupts();
+
+  // Fire all 4 triggers together (10 µs pulse each)
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    digitalWrite(TRIG_PINS[i], LOW);
+  }
+  delayMicroseconds(2);
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    digitalWrite(TRIG_PINS[i], HIGH);
+  }
+  delayMicroseconds(10);
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    digitalWrite(TRIG_PINS[i], LOW);
+  }
+
+  // Wait until all echoes have returned or timeout
+  unsigned long deadline = micros() + ECHO_TIMEOUT_US;
+  while (micros() < deadline) {
+    bool allDone = true;
+    for (int i = 0; i < NUM_SENSORS; i++) {
+      if (!echoReady[i]) { allDone = false; break; }
+    }
+    if (allDone) break;
+  }
+
+  // Convert durations to cm; treat timeout (echoReady still false) as 999
+  int raw[NUM_SENSORS];
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    if (!echoReady[i]) {
+      raw[i] = 999;
+    } else {
+      int cm = (int)(echoDur[i] * 0.0343f / 2.0f);
+      raw[i] = (cm < 2 || cm > MAX_DIST_CM) ? 999 : cm;
+    }
+  }
+
+  *dF = raw[0];
+  *dL = raw[1];
+  *dR = raw[2];
+  *dB = raw[3];
+}
 
 void setup() {
   Serial.begin(115200);
@@ -95,6 +192,8 @@ void setup() {
   pinMode(trig2, OUTPUT); pinMode(echo2, INPUT);
   pinMode(trig3, OUTPUT); pinMode(echo3, INPUT);
   pinMode(trig4, OUTPUT); pinMode(echo4, INPUT);
+
+  setupSensorInterrupts();
 
   // Motors
   pinMode(enA, OUTPUT); pinMode(in1, OUTPUT); pinMode(in2, OUTPUT);
@@ -116,97 +215,72 @@ void setup() {
 
   // Always load from sim-trained table — no flash, no on-bot learning
   memcpy(q_table, Q_TABLE_INIT, sizeof(q_table));
+  lastFreeMs = millis();
   logLine("Loaded sim-trained Q-table. Running in pure policy mode.");
 }
 
 void loop() {
   webServer.handleClient();
 
-  // --- Read all sensors first ---
-  int dF = readDistance(trig1, echo1); delay(8);
-  int dL = readDistance(trig2, echo2); delay(8);
-  int dR = readDistance(trig3, echo3); delay(8);
-  int dB = readDistance(trig4, echo4);
+  // Read all 4 sensors in parallel (~30 ms total vs ~400 ms sequential)
+  int dF, dL, dR, dB;
+  readAllSensors(&dF, &dL, &dR, &dB);
 
-  String mode;
+  // Build state and look up Q-table — purely RL, no hardcoded rules
+  currentState = encodeState(dF, dL, dR, dB);
 
-  // --- SAFETY SHIELD: front sensor overrides everything ---
-  // If wall is close ahead, always stop and turn — Q-table cannot override this
-  if (dF < SAFETY_CM) {
-    stop_motors();
-    delay(100);
+  // Reset free timer whenever bot is in open space
+  if (currentState == 0) lastFreeMs = millis();
 
-    // Only back up if nearly touching — otherwise tank turn in place
-    if (dF < BACKUP_CM) {
-      moveBackward();
-      delay(400);
-      stop_motors();
-      delay(100);
-    }
-
-    // Turn toward whichever side has more space
-    if (dR >= dL) {
-      tankTurnRight();
-    } else {
-      tankTurnLeft();
-    }
-    delay(750);
-    stop_motors();
-    delay(100);
-
-    mode = "SAFETY";
+  // Stuck detection — if not in open space for 10s, force escape
+  if (millis() - lastFreeMs > STUCK_MS) {
+    logLine("STUCK — escaping");
+    stop_motors(); delay(100);
+    moveBackward(); delay(700);
+    stop_motors(); delay(100);
+    tankTurnLeft(); delay(1000);  // turn opposite to Q-table default
+    stop_motors(); delay(100);
+    lastFreeMs = millis();  // reset so it doesn't immediately re-trigger
     prevAction = -1;
+    return;  // skip rest of loop, re-read sensors fresh next iteration
+  }
 
-  } else {
-    // --- Q-TABLE: front is clear, let Q-table guide behavior ---
-    currentState = get_encoded_state();
-    int action = get_best_action(currentState);
+  int action = get_best_action(currentState);
 
-    if (action == 0) {
-      // Q-table says forward — go
-      if (prevAction != 0 && prevAction != -1) { stop_motors(); delay(60); }
-      moveForward();
-      prevAction = 0;
-      delay(180);
-      mode = "FWD";
+  // Brief stop only when changing direction to avoid motor jerk
+  if (action != prevAction && prevAction != -1) {
+    stop_motors();
+    delay(80);
+  }
 
-    } else {
-      // Q-table says don't go forward — turn toward more space
-      stop_motors();
-      delay(100);
+  execute_action(action);
+  prevAction = action;
 
-      if (dB < NEAR_CM) {
-        moveForward();
-        delay(400);
-        mode = "ESCAPE";
-      } else if (dR >= dL) {
-        tankTurnRight();
-        delay(750);
-        mode = "Q-RIGHT";
-      } else {
-        tankTurnLeft();
-        delay(750);
-        mode = "Q-LEFT";
-      }
+  // Action durations — turns need more time to actually rotate meaningfully
+  if      (action == 0) delay(200);  // forward
+  else if (action == 1) delay(400);  // backward
+  else                  delay(600);  // left or right turn
 
-      stop_motors();
-      delay(100);
-      prevAction = action;
-    }
+  // Stop after turns/backward so next sensor read is clean
+  if (action != 0) {
+    stop_motors();
+    delay(80);
   }
 
   // WiFi log
-  String line = "F:" + String(dF) +
+  const char* actionNames[] = { "FWD", "BWD", "LEFT", "RIGHT" };
+  String line = "S:" + String(currentState) +
+                " A:" + String(actionNames[action]) +
+                " F:" + String(dF) +
                 " L:" + String(dL) +
                 " R:" + String(dR) +
-                " B:" + String(dB) +
-                " | " + mode;
+                " B:" + String(dB);
   logLine(line);
 
-  // Display live sensor distances + current mode
+  // OLED display
   display.clear();
   display.setFont(ArialMT_Plain_10);
-  display.drawString(0, 0, mode);
+  display.drawString(0, 0, "S:" + String(currentState) + " " + actionNames[action]);
   display.setFont(ArialMT_Plain_16);
   display.drawString(0,  14, "F:" + String(dF));
   display.drawString(64, 14, "B:" + String(dB));
@@ -217,35 +291,28 @@ void loop() {
 
 // --- HELPERS ---
 
-int readDistance(int trig, int echo) {
-  int r[3];
-  for (int i = 0; i < 3; i++) {
-    digitalWrite(trig, LOW);  delayMicroseconds(2);
-    digitalWrite(trig, HIGH); delayMicroseconds(10);
-    digitalWrite(trig, LOW);
-    long dur = pulseIn(echo, HIGH, 25000);
-    int cm = (dur == 0) ? 999 : (int)(dur * 0.0343 / 2);
-    r[i] = (cm < 2) ? 999 : cm;
-    delay(5);
-  }
-  // Return median of 3
-  if (r[0] > r[1]) { int t = r[0]; r[0] = r[1]; r[1] = t; }
-  if (r[1] > r[2]) { int t = r[1]; r[1] = r[2]; r[2] = t; }
-  if (r[0] > r[1]) { int t = r[0]; r[0] = r[1]; r[1] = t; }
-  return r[1];
-}
+int encodeState(int dF, int dL, int dR, int dB) {
+  static bool nearF = false, nearL = false, nearR = false, nearB = false;
 
-int get_encoded_state() {
-  int dF = readDistance(trig1, echo1); delay(8);
-  int dL = readDistance(trig2, echo2); delay(8);
-  int dR = readDistance(trig3, echo3); delay(8);
-  int dB = readDistance(trig4, echo4);
+  // Each axis: latch true when reading drops below THRESH_CLOSE,
+  // release only when it rises above THRESH_CLEAR.
+  if      (dF > 0 && dF < THRESH_CLOSE) nearF = true;
+  else if (dF > THRESH_CLEAR)           nearF = false;
+
+  if      (dL > 0 && dL < THRESH_CLOSE) nearL = true;
+  else if (dL > THRESH_CLEAR)           nearL = false;
+
+  if      (dR > 0 && dR < THRESH_CLOSE) nearR = true;
+  else if (dR > THRESH_CLEAR)           nearR = false;
+
+  if      (dB > 0 && dB < THRESH_CLOSE) nearB = true;
+  else if (dB > THRESH_CLEAR)           nearB = false;
 
   int state = 0;
-  if (dF > 0 && dF < NEAR_CM) state |= (1 << BIT_FRONT);
-  if (dL > 0 && dL < NEAR_CM) state |= (1 << BIT_LEFT);
-  if (dR > 0 && dR < NEAR_CM) state |= (1 << BIT_RIGHT);
-  if (dB > 0 && dB < NEAR_CM) state |= (1 << BIT_BACK);
+  if (nearF) state |= (1 << BIT_FRONT);
+  if (nearL) state |= (1 << BIT_LEFT);
+  if (nearR) state |= (1 << BIT_RIGHT);
+  if (nearB) state |= (1 << BIT_BACK);
   return state;
 }
 
