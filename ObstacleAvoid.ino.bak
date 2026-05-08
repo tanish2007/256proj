@@ -1,0 +1,175 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include "SSD1306Wire.h"
+
+// Sensors
+const int trig1 = 4,  echo1 = 18;  // Front
+const int trig2 = 19, echo2 = 23;  // Left
+const int trig3 = 32, echo3 = 26;  // Right
+const int trig4 = 5,  echo4 = 16;  // Back
+
+// Motors
+const int enA = 15, in1 = 13, in2 = 12;
+const int enB = 33, in3 = 14, in4 = 27;
+const int SPEED = 255;
+
+// Distance thresholds
+const int FRONT_CM = 30;
+const int SIDE_CM  = 15;
+
+// Action durations
+// TURN_MS: increase if bot still faces obstacle after turning (try 900, 1100, 1300)
+const int BACKUP_MS  = 500;
+const int TURN_MS    = 1000;  // increased — full ~90 degree tank turn
+const int CORRECT_MS = 250;
+
+// Stuck detection — if not moving freely for this long, trigger escape
+const unsigned long STUCK_TIMEOUT_MS = 10000;  // 10 seconds
+unsigned long lastFreeMs = 0;  // last time bot was moving forward freely
+
+SSD1306Wire display(0x3c, 21, 22);
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(trig1, OUTPUT); pinMode(echo1, INPUT);
+  pinMode(trig2, OUTPUT); pinMode(echo2, INPUT);
+  pinMode(trig3, OUTPUT); pinMode(echo3, INPUT);
+  pinMode(trig4, OUTPUT); pinMode(echo4, INPUT);
+
+  pinMode(enA, OUTPUT); pinMode(in1, OUTPUT); pinMode(in2, OUTPUT);
+  pinMode(enB, OUTPUT); pinMode(in3, OUTPUT); pinMode(in4, OUTPUT);
+  analogWrite(enA, SPEED);
+  analogWrite(enB, SPEED);
+
+  stopCar();
+  lastFreeMs = millis();
+
+  display.init();
+  display.flipScreenVertically();
+  display.setTextAlignment(TEXT_ALIGN_LEFT);
+  display.clear();
+  display.drawString(0, 0, "Ready");
+  display.display();
+}
+
+void loop() {
+  int dF = readSensor(trig1, echo1); delay(12);
+  int dL = readSensor(trig2, echo2); delay(12);
+  int dR = readSensor(trig3, echo3); delay(12);
+  int dB = readSensor(trig4, echo4);
+
+  String status;
+
+  // --- Stuck detection: if not free for 10+ seconds, run escape ---
+  bool isStuck = (millis() - lastFreeMs) > STUCK_TIMEOUT_MS;
+
+  if (isStuck) {
+    status = "ESCAPE";
+    stopCar();
+    delay(100);
+
+    // Back up longer than normal
+    moveBackward();
+    delay(800);
+    stopCar();
+    delay(100);
+
+    // Turn LEFT (opposite to normal) for longer to break the pattern
+    tankTurnLeft();
+    delay(1400);
+    stopCar();
+    delay(100);
+
+    lastFreeMs = millis();  // reset stuck timer after escape
+
+  } else if (dF < FRONT_CM) {
+    status = "OBSTACLE";
+    stopCar();
+    delay(100);
+
+    moveBackward();
+    delay(BACKUP_MS);
+    stopCar();
+    delay(100);
+
+    tankTurnRight();
+    delay(TURN_MS);
+    stopCar();
+    delay(100);
+
+  } else if (dR < SIDE_CM) {
+    status = "AVOID R";
+    tankTurnLeft();
+    delay(CORRECT_MS);
+    stopCar();
+
+  } else if (dL < SIDE_CM) {
+    status = "AVOID L";
+    tankTurnRight();
+    delay(CORRECT_MS);
+    stopCar();
+
+  } else {
+    moveForward();
+    status = "FORWARD";
+    lastFreeMs = millis();  // reset stuck timer — bot is moving freely
+  }
+
+  Serial.printf("F:%-4d L:%-4d R:%-4d B:%-4d | %s | free_for:%.1fs\n",
+    dF, dL, dR, dB, status.c_str(),
+    (millis() - lastFreeMs) / 1000.0);
+
+  display.clear();
+  display.setFont(ArialMT_Plain_10);
+  display.drawString(0, 0, status);
+  display.setFont(ArialMT_Plain_16);
+  display.drawString(0,  14, "F:" + String(dF));
+  display.drawString(64, 14, "B:" + String(dB));
+  display.drawString(0,  34, "L:" + String(dL));
+  display.drawString(64, 34, "R:" + String(dR));
+  display.display();
+}
+
+// 5-reading median with noise filtering
+int readSensor(int trig, int echo) {
+  int r[5];
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(trig, LOW);  delayMicroseconds(2);
+    digitalWrite(trig, HIGH); delayMicroseconds(10);
+    digitalWrite(trig, LOW);
+    long dur = pulseIn(echo, HIGH, 25000);
+    int cm = (dur == 0) ? 999 : (int)(dur * 0.0343 / 2);
+    r[i] = (cm < 2) ? 999 : cm;
+    delay(8);
+  }
+  for (int i = 0; i < 4; i++)
+    for (int j = i + 1; j < 5; j++)
+      if (r[i] > r[j]) { int t = r[i]; r[i] = r[j]; r[j] = t; }
+  return r[2];
+}
+
+void moveForward() {
+  digitalWrite(in1, LOW);  digitalWrite(in2, HIGH);
+  digitalWrite(in3, HIGH); digitalWrite(in4, LOW);
+}
+
+void moveBackward() {
+  digitalWrite(in1, HIGH); digitalWrite(in2, LOW);
+  digitalWrite(in3, LOW);  digitalWrite(in4, HIGH);
+}
+
+void tankTurnLeft() {
+  digitalWrite(in1, HIGH); digitalWrite(in2, LOW);
+  digitalWrite(in3, HIGH); digitalWrite(in4, LOW);
+}
+
+void tankTurnRight() {
+  digitalWrite(in1, LOW);  digitalWrite(in2, HIGH);
+  digitalWrite(in3, LOW);  digitalWrite(in4, HIGH);
+}
+
+void stopCar() {
+  digitalWrite(in1, LOW); digitalWrite(in2, LOW);
+  digitalWrite(in3, LOW); digitalWrite(in4, LOW);
+}

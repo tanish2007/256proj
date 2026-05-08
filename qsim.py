@@ -14,7 +14,7 @@ import random
 # ----- Must match Q_learning.ino -----
 NUM_STATES  = 16   # 2^4 sensors: F, L, R, B
 NUM_ACTIONS = 4    # 0:Fwd, 1:Bwd, 2:Left, 3:Right
-NEAR_CM     = 15   # threshold for "near" bit
+NEAR_CM     = 30   # threshold for "near" bit — matches Q_learning.ino
 BIT_F, BIT_L, BIT_R, BIT_B = 0, 1, 2, 3
 
 # ----- Q-learning hyperparams -----
@@ -50,7 +50,13 @@ SENSOR_B_DEG = 180
 OBSTACLES = [
     (60, 60, 30, 30),     # small box left-of-center
     (130, 110, 25, 50),   # tall rectangle on the right
-    (40, 150, 60, 20),    # wide rectangle near the top-left
+    (40, 150, 60, 20),    # wide rectangle near top-left
+    (150, 30, 30, 25),    # box bottom-right
+    (20, 95, 25, 30),     # narrow box on left
+    (95, 25, 20, 35),     # vertical box bottom-center
+    (155, 165, 30, 20),   # box top-right
+    (90, 130, 25, 25),    # small center-upper
+    (165, 75, 20, 25),    # right-middle
 ]
 
 
@@ -150,22 +156,28 @@ class World:
         return crashed
 
 
-def reward_fn(action, next_state, crashed):
-    """Mirrors calculate_reward() in Q_learning.ino, plus crash term."""
-    front_near = next_state & (1 << BIT_F)
-    back_near  = next_state & (1 << BIT_B)
+def reward_fn(action, current_state, crashed):
+    """
+    Reward the decision, not the outcome:
+    - "Forward when nothing's in front" is a good decision regardless of where it lands.
+    - "Forward when something's in front" is a bad decision.
+    Mirrors calculate_reward() in Q_learning.ino.
+    """
+    front_near = current_state & (1 << BIT_F)
+    back_near  = current_state & (1 << BIT_B)
     if crashed:                         return -100   # actual collision
-    if action == 0 and front_near:      return -5     # mild warning (was -10)
-    if action == 1 and back_near:       return -5     # mild warning (was -10)
-    if action == 0 and not front_near:  return 20     # reward forward motion
-    return -2                                          # turning
+    if action == 0 and front_near:      return -5     # bad decision: forward into wall
+    if action == 1 and back_near:       return -5     # bad decision: backward into wall
+    if action == 0 and not front_near:  return 20     # good decision: forward in clear path
+    return -2                                          # turning costs a bit
 
 
 def argmax(row):
     return max(range(len(row)), key=lambda i: row[i])
 
 
-def train():
+def train(seed=0):
+    random.seed(seed)
     Q = [[0.0] * NUM_ACTIONS for _ in range(NUM_STATES)]
     eps = EPS_START
     world = World()
@@ -189,13 +201,13 @@ def train():
 
             crashed = world.step(a)
             s2 = world.get_state()
-            r = reward_fn(a, s2, crashed)
+            r = reward_fn(a, s, crashed)  # reward based on current state s, not s2
 
-            # Same-state stuck detection
+            # Same-state stuck detection. Don't penalize being in state 0 (open space).
             if s2 == last_state: same_count += 1
             else:                same_count = 0
             last_state = s2
-            if same_count >= STUCK_LIMIT: r -= STUCK_PENALTY
+            if same_count >= STUCK_LIMIT and s2 != 0: r -= STUCK_PENALTY
 
             # Position-based oscillation detection (catches FWD/BWD loops)
             if step - anchor_step >= NO_PROGRESS_LIMIT_STEPS:
@@ -245,7 +257,6 @@ def show_policy(Q):
 
 
 if __name__ == "__main__":
-    random.seed(0)
-    Q = train()
+    Q = train()  # seed is set inside train()
     show_policy(Q)
     export_header(Q)

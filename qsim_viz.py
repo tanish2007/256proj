@@ -124,8 +124,8 @@ def draw_panel(screen, font, lines):
 
 
 def main():
-    print("Training Q-table headlessly...")
-    Q = train()
+    print("Training Q-table headlessly (seed=0, so this matches q_table.h)...")
+    Q = train(seed=0)
     print("Done. Opening visualization.")
 
     pygame.init()
